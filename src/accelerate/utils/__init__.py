@@ -68,6 +68,7 @@ from .offload import (
     offload_state_dict,
     offload_weight,
     save_offload_index,
+    move_offloads,
 )
 from .operations import (
     broadcast,

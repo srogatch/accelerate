@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import gc
 import json
 import os
 from collections.abc import Mapping
@@ -19,54 +19,198 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
+import zfpy
+import einops
 
 from ..logging import get_logger
 from .imports import is_safetensors_available
 
 
 logger = get_logger(__name__)
+compressed = dict()
+
+
+# PCA: https://github.com/gngdb/pytorch-pca/blob/61b14afbb0c401e4c4992199497520262be10b14/pca.py#L60
+def svd_flip_v(u, v):
+    # columns of u, rows of v
+    max_abs_cols = torch.argmax(torch.abs(u), 0)
+    i = torch.arange(u.shape[1]).to(u.device)
+    signs = torch.sign(u[max_abs_cols, i])
+    v *= signs.view(-1, 1)
+    return v
+
+
+class GpuPcaOffload:
+    def __init__(self, weight: torch.Tensor):
+        self.block_len = 32
+        self.orig_feature_size = self.block_len * self.block_len
+        self.compression_rate = 2
+        self.n_components = int(self.block_len * self.block_len / self.compression_rate)
+        self.orig_shape = weight.size()
+
+        with torch.no_grad():
+            weight = weight.to('cpu')
+            orig_weight = weight
+            if self.orig_shape[0] % self.block_len != 0 or self.orig_shape[1] % self.block_len != 0:
+                weight = torch.nn.functional.pad(
+                    weight,
+                    (0, self.block_len - self.orig_shape[1], 0, self.block_len - self.orig_shape[0]),
+                    'constant', 0)
+            self.padded_shape = weight.size()
+            weight = weight.unfold(0, self.block_len, self.block_len).unfold(1, self.block_len, self.block_len)
+            weight = weight.reshape(
+                (self.padded_shape[0]*self.padded_shape[1]) // self.orig_feature_size,
+                self.orig_feature_size)
+            self.mean = weight.mean(dim=(-2,), keepdim=True)
+            weight.sub_(self.mean)
+            U, S, V = torch.pca_lowrank(weight, q=self.n_components, center=False)
+            self.components = svd_flip_v(U, V.T)
+            self.projection = torch.matmul(weight, self.components.T)
+
+            # Sanity check
+            decompressed = self.decompress()
+            decompressed = decompressed.to('cpu')
+            good = torch.allclose(decompressed, orig_weight, atol=1e-6, rtol=1e-4)
+            abs_dev = torch.max(torch.abs(orig_weight-decompressed))
+            rel_dev = torch.max(torch.abs(orig_weight-decompressed)
+                                / torch.maximum(torch.abs(orig_weight), torch.abs(decompressed)))
+
+            print(f'All close: {good}, abs_dev={abs_dev} rel_dev={rel_dev}')
+
+    # def decompress(self, device=None):
+    #     if device is not None:
+    #         mean = self.mean.to(device)
+    #         components = self.components.to(device)
+    #         projection = self.projection.to(device)
+    #     approx = torch.matmul(projection, components)
+    #     del components
+    #     del projection
+    #     approx.add_(mean)
+    #     del mean
+    #     # ans = einops.rearrange('(s1 s2) (f1 f2) -> (s1 f1) (s2 f2)')
+    #     # https://stackoverflow.com/a/66784823/1915854
+    #     tile_x, tile_y  = self.block_len, self.block_len
+    #     n_x_splits = self.padded_shape[0] // self.block_len
+    #     n_y_splits = self.padded_shape[1] // self.block_len
+    #     approx = approx.reshape(n_x_splits, n_y_splits, tile_x, tile_y)
+    #     approx = approx.permute(0, 2, 1, 3).reshape(tile_x * n_x_splits, tile_y * n_y_splits)
+    #     ans = approx[:self.orig_shape[0], :self.orig_shape[1]]
+    #     del approx
+    #     gc.collect()
+    #     return ans
+
+    def decompress(self, device=None):
+        if device is not None:
+            self.mean = self.mean.to(device)
+            self.components = self.components.to(device)
+            self.projection = self.projection.to(device)
+        approx = torch.matmul(self.projection, self.components)
+        approx.add_(self.mean)
+        # ans = einops.rearrange('(s1 s2) (f1 f2) -> (s1 f1) (s2 f2)')
+        # https://stackoverflow.com/a/66784823/1915854
+        tile_x, tile_y  = self.block_len, self.block_len
+        n_x_splits = self.padded_shape[0] // self.block_len
+        n_y_splits = self.padded_shape[1] // self.block_len
+        approx = approx.reshape(n_x_splits, n_y_splits, tile_x, tile_y)
+        approx = approx.permute(0, 2, 1, 3).reshape(tile_x * n_x_splits, tile_y * n_y_splits)
+        ans = approx[:self.orig_shape[0], :self.orig_shape[1]]
+        return ans
+
+class CpuZfpOffload:
+    def __init__(self, weight: np.ndarray):
+        self.comp_data = None
+        self.orig_data = None
+        # if np.issubdtype(weight.dtype, np.floating):
+        #     self.comp_data = zfpy.compress_numpy(weight, rate=16)  # 16 bit per floating point number
+        # else:
+        self.orig_data = weight
+
+    def decompress(self) -> np.ndarray:
+        # if self.comp_data is not None:
+        #     return zfpy.decompress_numpy(self.comp_data)
+        # else:
+        return self.orig_data
+
+
+def move_offloads(offload_folder, prefix, offload_index):
+    extension = ".dat"
+    new_compressed = dict()
+    folder_str = str(offload_folder)
+    if not folder_str.endswith('/'):
+        folder_str += '/'
+    global compressed
+    for key, val in compressed.items():
+        if not key.startswith(folder_str):
+            new_compressed[key] = val
+            continue
+        if not key.endswith(extension):
+            new_compressed[key] = val
+            continue
+        weight_name = key[len(folder_str):-len(extension)]
+        if weight_name not in offload_index:
+            new_compressed[key] = val
+            continue
+        new_key = f"{folder_str}{prefix}.{weight_name}{extension}"
+        new_compressed[new_key] = val
+    compressed = new_compressed
 
 
 def offload_weight(weight, weight_name, offload_folder, index=None):
-    dtype = None
-    # Check the string instead of the dtype to be compatible with versions of PyTorch that don't have bfloat16.
-    if str(weight.dtype) == "torch.bfloat16":
-        # Need to reinterpret the underlined data as int16 since NumPy does not handle bfloat16s.
-        weight = weight.view(torch.int16)
-        dtype = "bfloat16"
-    array = weight.cpu().numpy()
     tensor_file = os.path.join(offload_folder, f"{weight_name}.dat")
-    if index is not None:
-        if dtype is None:
-            dtype = str(array.dtype)
-        index[weight_name] = {"dtype": dtype, "shape": list(array.shape)}
-    if array.ndim == 0:
-        array = array[None]
-    file_array = np.memmap(tensor_file, dtype=array.dtype, mode="w+", shape=array.shape)
-    file_array[:] = array[:]
-    file_array.flush()
+    if weight.dim() == 2 and torch.is_floating_point(weight):
+        compressed[tensor_file] = GpuPcaOffload(weight)
+        if index is not None:
+            dtype = str(weight.dtype)
+            torch_prefix = 'torch.'
+            if dtype.startswith(torch_prefix):
+                dtype = dtype[len(torch_prefix):]
+            index[weight_name] = {"dtype": dtype, "shape": list(weight.size())}
+    else:
+        dtype = None
+        # Check the string instead of the dtype to be compatible with versions of PyTorch that don't have bfloat16.
+        if str(weight.dtype) == "torch.bfloat16":
+            # Need to reinterpret the underlined data as int16 since NumPy does not handle bfloat16s.
+            weight = weight.view(torch.int16)
+            dtype = "bfloat16"
+        array = weight.cpu().numpy()
+        if index is not None:
+            if dtype is None:
+                dtype = str(array.dtype)
+            index[weight_name] = {"dtype": dtype, "shape": list(array.shape)}
+        if array.ndim == 0:
+            array = array[None]
+        compressed[tensor_file] = CpuZfpOffload(array)
+        # file_array = np.memmap(tensor_file, dtype=array.dtype, mode="w+", shape=array.shape)
+        # file_array[:] = array[:]
+        # file_array.flush()
     return index
 
 
-def load_offloaded_weight(weight_file, weight_info):
-    shape = tuple(weight_info["shape"])
-    if shape == ():
-        # NumPy memory-mapped arrays can't have 0 dims so it was saved as 1d tensor
-        shape = (1,)
+def load_offloaded_weight(weight_file, weight_info, device=None):
+    comp_obj = compressed[weight_file]
+    if isinstance(comp_obj, CpuZfpOffload):
+        shape = tuple(weight_info["shape"])
+        if shape == ():
+            # NumPy memory-mapped arrays can't have 0 dims so it was saved as 1d tensor
+            shape = (1,)
 
-    dtype = weight_info["dtype"]
-    if dtype == "bfloat16":
-        # NumPy does not support bfloat16 so this was saved as a int16
-        dtype = "int16"
+        dtype = weight_info["dtype"]
+        if dtype == "bfloat16":
+            # NumPy does not support bfloat16 so this was saved as a int16
+            dtype = "int16"
 
-    weight = np.memmap(weight_file, dtype=dtype, shape=shape, mode="r")
+        # weight = np.memmap(weight_file, dtype=dtype, shape=shape, mode="r")
+        weight = comp_obj.decompress()
 
-    if len(weight_info["shape"]) == 0:
-        weight = weight[0]
-    weight = torch.tensor(weight)
-    if weight_info["dtype"] == "bfloat16":
-        weight = weight.view(torch.bfloat16)
-
+        if len(weight_info["shape"]) == 0:
+            weight = weight[0]
+        weight = torch.tensor(weight)
+        if weight_info["dtype"] == "bfloat16":
+            weight = weight.view(torch.bfloat16)
+    elif isinstance(comp_obj, GpuPcaOffload):
+        weight = comp_obj.decompress(device)
+    else:
+        raise RuntimeError(f"Unhandled compressed object type: {str(comp_obj)}")
     return weight
 
 
@@ -188,7 +332,7 @@ class OffloadedWeightsLoader(Mapping):
                 return tensor
 
         weight_file = os.path.join(self.save_folder, f"{key}.dat")
-        return load_offloaded_weight(weight_file, weight_info)
+        return load_offloaded_weight(weight_file, weight_info, device=self.device)
 
     def __iter__(self):
         return iter(self.all_keys)

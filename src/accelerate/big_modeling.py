@@ -268,7 +268,7 @@ def disk_offload(
         offload_state_dict(offload_dir, model.state_dict())
     if execution_device is None:
         execution_device = next(iter(model.parameters())).device
-    weights_map = OffloadedWeightsLoader(save_folder=offload_dir)
+    weights_map = OffloadedWeightsLoader(save_folder=offload_dir, device=execution_device)
 
     add_hook_to_module(model, AlignDevicesHook(io_same_device=True), append=True)
     attach_align_device_hook(
@@ -359,9 +359,9 @@ def dispatch_model(
     offload = {name: device in offloaded_devices for name, device in device_map.items()}
     save_folder = offload_dir if len(disk_modules) > 0 else None
     if state_dict is not None or save_folder is not None or offload_index is not None:
-        device = main_device if offload_index is not None else None
+        # device = main_device if offload_index is not None else None
         weights_map = OffloadedWeightsLoader(
-            state_dict=state_dict, save_folder=save_folder, index=offload_index, device=device
+            state_dict=state_dict, save_folder=save_folder, index=offload_index, device=main_device
         )
     else:
         weights_map = None
